@@ -6205,6 +6205,120 @@ func testServerHijackGetsBackgroundByte_big(t *testing.T, mode testMode) {
 	<-done
 }
 
+func BenchmarkServerHijackMemoryUsage(b *testing.B) {
+	echo := []byte("echo 01234")
+
+	// Client mode
+	if url := os.Getenv("TEST_BENCH_SERVER_URL"); url != "" {
+		n, err := strconv.Atoi(os.Getenv("TEST_BENCH_CLIENT_N"))
+		if err != nil {
+			panic(err)
+		}
+		clientBodies := make([]io.ReadWriteCloser, n)
+		for i := 0; i < n; i++ {
+			res, err := Get(url)
+			if err != nil {
+				log.Panicf("Get: %v", err)
+			}
+			clientBodies[i] = res.Body.(io.ReadWriteCloser)
+		}
+		for _, rwc := range clientBodies {
+			if _, err := rwc.Write(echo); err != nil {
+				log.Panicf("write: %v", err)
+			}
+		}
+		readBuf := bytes.Buffer{}
+		readBuf.Grow(bytes.MinRead)
+		for _, rwc := range clientBodies {
+			readBuf.Reset()
+			n, err := readBuf.ReadFrom(rwc)
+			if err != nil || n != int64(len(echo)) {
+				log.Panicf("read: want=4, got=%d, err=%v", n, err)
+			}
+			reply := readBuf.Bytes()
+			if !bytes.Equal(reply, echo) {
+				log.Panicf("echo: want=%q, got=%q", string(echo), string(reply))
+			}
+			rwc.Close()
+		}
+		os.Exit(0)
+		return
+	}
+
+	// Server mode
+	type waitingConn struct {
+		rwc   net.Conn
+		rwBuf *bufio.ReadWriter
+	}
+	waitingConns := make(chan waitingConn, b.N)
+	handlerDone := make(chan struct{})
+	var before runtime.MemStats
+	var after runtime.MemStats
+
+	cst := newClientServerTest(b, http1Mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.Header().Set("Connection", "Upgrade")
+		w.Header().Set("Upgrade", "someProto")
+		w.WriteHeader(StatusSwitchingProtocols)
+		rwc, rwBuf, err := w.(Hijacker).Hijack()
+		if err != nil {
+			b.Error(err)
+		}
+		waitingConns <- waitingConn{rwc, rwBuf}
+		handlerDone <- struct{}{}
+		// exit from handler, hold on to conn+buffer
+	}))
+
+	// Start client
+	cmd := testenv.Command(b, os.Args[0], "-test.run=^$", "-test.bench=^BenchmarkServerHijackMemoryUsage$")
+	cmd.Env = append([]string{
+		fmt.Sprintf("TEST_BENCH_CLIENT_N=%d", b.N),
+		fmt.Sprintf("TEST_BENCH_SERVER_URL=%s", cst.ts.URL),
+	}, os.Environ()...)
+	var outputBuf bytes.Buffer
+	outputBuf.Grow(4096)
+	cmd.Stdout = &outputBuf
+	cmd.Stderr = &outputBuf
+	if err := cmd.Start(); err != nil {
+		b.Fatal(err)
+	}
+
+	runtime.ReadMemStats(&before)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	// accumulate connections
+	for i := 0; i < b.N; i++ {
+		<-handlerDone
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	b.ReportMetric(
+		float64(after.Alloc-before.Alloc)/float64(b.N), "retained_B/op",
+	)
+
+	close(waitingConns)
+	close(handlerDone)
+
+	// verify w+r
+	for wc := range waitingConns {
+		got, err := wc.rwBuf.Peek(len(echo))
+		if err != nil {
+			b.Fatal(err)
+		} else if !bytes.Equal(got, echo) {
+			b.Fatalf("echo=%q got=%q", string(echo), string(got))
+		}
+		wc.rwBuf.Write(got)
+		wc.rwBuf.Flush()
+		wc.rwc.Close()
+	}
+
+	// Check client result
+	if err := cmd.Wait(); err != nil {
+		b.Fatalf("client: %v, with output: %s", err, outputBuf.String())
+	}
+}
+
 // Issue 18319: test that the Server validates the request method.
 func TestServerValidatesMethod(t *testing.T) {
 	tests := []struct {
