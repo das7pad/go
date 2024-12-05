@@ -31,7 +31,6 @@ import (
 	"sync/atomic"
 	"time"
 	_ "unsafe" // for linkname
-	"weak"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -331,7 +330,15 @@ func (c *conn) hijackLocked(w *response) (rwc net.Conn, buf *bufio.ReadWriter, e
 		}
 	}
 
-	ccn := &connCloseNotify{rwc: rwc, weakResponse: weak.Make(w)}
+	ccn := connCloseNotify{rwc: rwc}
+	w.lazyCloseNotifyMu.Lock()
+	if w.lazyCloseNotify != nil {
+		ccn.lazyCloseNotify.copyFrom(w.lazyCloseNotify)
+	} else {
+		ccn.lazyCloseNotify.cancelCtxFn = w.cancelCtxFn
+	}
+	w.lazyCloseNotify = &ccn.lazyCloseNotify
+	w.lazyCloseNotifyMu.Unlock()
 	ccn.attach(c.bufr)
 	c.bufw.Reset(rwc)
 	buf = bufio.NewReadWriter(c.bufr, c.bufw)
@@ -431,10 +438,9 @@ type response struct {
 	conn             *conn
 	req              *Request // request for this response
 	reqBody          io.ReadCloser
-	cancelCtx        context.CancelFunc // when ServeHTTP exits
-	wroteHeader      bool               // a non-1xx header has been (logically) written
-	wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
-	wantsClose       bool               // HTTP request has Connection "close"
+	wroteHeader      bool // a non-1xx header has been (logically) written
+	wants10KeepAlive bool // HTTP/1.0 w/ Connection "keep-alive"
+	wantsClose       bool // HTTP request has Connection "close"
 
 	// canWriteContinue is an atomic boolean that says whether or
 	// not a 100 Continue header can be written to the
@@ -479,9 +485,6 @@ type response struct {
 	// input from it.
 	requestBodyLimitHit bool
 
-	// closeNotifyTriggered tracks prior closeNotify calls.
-	closeNotifyTriggered bool
-
 	// trailers are the headers to be sent after the handler
 	// finishes writing the body. This field is initialized from
 	// the Trailer response header when the response header is
@@ -495,10 +498,10 @@ type response struct {
 	clenBuf   [10]byte
 	statusBuf [3]byte
 
-	// lazyCloseNotifyMu protects closeNotifyCh and closeNotifyTriggered.
+	// lazyCloseNotifyMu protects lazyCloseNotify and cancelCtxFn.
 	lazyCloseNotifyMu sync.Mutex
-	// closeNotifyCh is the channel returned by CloseNotify.
-	closeNotifyCh chan bool
+	lazyCloseNotify   *lazyCloseNotify
+	cancelCtxFn       context.CancelFunc // when ServeHTTP exits
 }
 
 func (c *response) SetReadDeadline(deadline time.Time) error {
@@ -655,14 +658,12 @@ type readResult struct {
 }
 
 // connCloseNotify is a minimal version of [connReader] for use by [Hijacker]
-// to notify any [CloseNotifier] on read errors before the handler exists. It
-// allows the hijacked [conn], [response] and [Request] to get garbage
-// collected after the handler exits.
+// to notify any [CloseNotifier] on read errors. It allows the hijacked [conn],
+// [response] and [Request] to get garbage collected after the handler exits.
 type connCloseNotify struct {
 	// rwc is the underlying network connection.
-	rwc net.Conn
-	// weakResponse points at the [response] until the handler exits.
-	weakResponse weak.Pointer[response]
+	rwc             net.Conn
+	lazyCloseNotify lazyCloseNotify
 	// previousBufferContents holds on to previously buffered bytes of the read buffer.
 	previousBufferContents []byte
 }
@@ -675,10 +676,7 @@ func (c *connCloseNotify) Read(p []byte) (n int, err error) {
 	}
 	n, err = c.rwc.Read(p)
 	if err != nil {
-		if w := c.weakResponse.Value(); w != nil {
-			w.cancelCtx()
-			w.closeNotify()
-		}
+		c.lazyCloseNotify.closeNotify()
 	}
 	return
 }
@@ -696,6 +694,70 @@ func (c *connCloseNotify) attach(r *bufio.Reader) (err error) {
 		_, err = r.Peek(n)
 	}
 	return
+}
+
+// lazyCloseNotify lazily allocates the [CloseNotifier] channel, and notifies
+// said channel and cancels the request context as needed.
+type lazyCloseNotify struct {
+	// mu protects all fields
+	mu sync.Mutex
+
+	// cancelCtxFn is called when ServeHTTP exits and also when observing read errors.
+	cancelCtxFn context.CancelFunc
+
+	// closeNotifyCh is the channel returned by initCloseNotify.
+	closeNotifyCh chan bool
+
+	// closed tracks prior closeNotify calls.
+	closed bool
+}
+
+func (l *lazyCloseNotify) copyFrom(other *lazyCloseNotify) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	other.mu.Lock()
+	defer other.mu.Unlock()
+	l.cancelCtxFn = other.cancelCtxFn
+	l.closeNotifyCh = other.closeNotifyCh
+	l.closed = other.closed
+}
+
+func (l *lazyCloseNotify) initCloseNotify() <-chan bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closeNotifyCh == nil {
+		l.closeNotifyCh = make(chan bool, 1)
+		if l.closed {
+			l.closeNotifyCh <- true // action prior closeNotify call
+		}
+	}
+	return l.closeNotifyCh
+}
+
+func (l *lazyCloseNotify) closeNotify() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
+	l.closed = true
+	if l.closeNotifyCh != nil {
+		l.closeNotifyCh <- true
+	}
+	l.cancelCtxLocked()
+}
+
+func (l *lazyCloseNotify) cancelCtx() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cancelCtxLocked()
+}
+
+func (l *lazyCloseNotify) cancelCtxLocked() {
+	if l.cancelCtxFn != nil {
+		l.cancelCtxFn()
+		l.cancelCtxFn = nil // free request context
+	}
 }
 
 // connReader is the io.Reader wrapper used by *conn. It combines a
@@ -1147,7 +1209,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 
 	w = &response{
 		conn:          c,
-		cancelCtx:     cancelCtx,
+		cancelCtxFn:   cancelCtx,
 		req:           req,
 		reqBody:       req.Body,
 		handlerHeader: make(Header),
@@ -2306,24 +2368,36 @@ func (w *response) CloseNotify() <-chan bool {
 	if w.handlerDone.Load() {
 		panic("net/http: CloseNotify called after ServeHTTP finished")
 	}
-	if w.closeNotifyCh == nil {
-		w.closeNotifyCh = make(chan bool, 1)
-		if w.closeNotifyTriggered {
-			w.closeNotifyCh <- true // action prior closeNotify call
-		}
+	if w.lazyCloseNotify == nil {
+		w.lazyCloseNotify = &lazyCloseNotify{cancelCtxFn: w.cancelCtxFn}
 	}
-	return w.closeNotifyCh
+
+	return w.lazyCloseNotify.initCloseNotify()
 }
 
 func (w *response) closeNotify() {
 	w.lazyCloseNotifyMu.Lock()
 	defer w.lazyCloseNotifyMu.Unlock()
-	if w.closeNotifyTriggered {
-		return // already triggered
+	if w.lazyCloseNotify == nil {
+		if w.handlerDone.Load() {
+			// CloseNotify will panic when attempting to acquire the channel
+			// after the handler has exited. Skip allocating lazyCloseNotify.
+			return
+		}
+		w.lazyCloseNotify = &lazyCloseNotify{cancelCtxFn: w.cancelCtxFn}
 	}
-	w.closeNotifyTriggered = true
-	if w.closeNotifyCh != nil {
-		w.closeNotifyCh <- true
+
+	w.lazyCloseNotify.closeNotify()
+}
+
+func (w *response) cancelCtx() {
+	w.lazyCloseNotifyMu.Lock()
+	defer w.lazyCloseNotifyMu.Unlock()
+	if w.lazyCloseNotify != nil {
+		w.lazyCloseNotify.cancelCtx() // free reference to context
+	} else if w.cancelCtxFn != nil {
+		w.cancelCtxFn()
+		w.cancelCtxFn = nil
 	}
 }
 
