@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 	_ "unsafe" // for linkname
+	"weak"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -314,7 +315,7 @@ func (c *conn) hijacked() bool {
 }
 
 // c.mu must be held.
-func (c *conn) hijackLocked() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
+func (c *conn) hijackLocked(w *response) (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 	if c.hijackedv {
 		return nil, nil, ErrHijacked
 	}
@@ -329,6 +330,9 @@ func (c *conn) hijackLocked() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 			return nil, nil, fmt.Errorf("unexpected Peek failure reading buffered byte: %v", err)
 		}
 	}
+
+	ccn := &connCloseNotify{rwc: rwc, weakResponse: weak.Make(w)}
+	ccn.attach(c.bufr)
 	c.bufw.Reset(rwc)
 	buf = bufio.NewReadWriter(c.bufr, c.bufw)
 
@@ -648,6 +652,50 @@ type readResult struct {
 	n   int
 	err error
 	b   byte // byte read, if n == 1
+}
+
+// connCloseNotify is a minimal version of [connReader] for use by [Hijacker]
+// to notify any [CloseNotifier] on read errors before the handler exists. It
+// allows the hijacked [conn], [response] and [Request] to get garbage
+// collected after the handler exits.
+type connCloseNotify struct {
+	// rwc is the underlying network connection.
+	rwc net.Conn
+	// weakResponse points at the [response] until the handler exits.
+	weakResponse weak.Pointer[response]
+	// previousBufferContents holds on to previously buffered bytes of the read buffer.
+	previousBufferContents []byte
+}
+
+func (c *connCloseNotify) Read(p []byte) (n int, err error) {
+	if c.previousBufferContents != nil {
+		n = copy(p, c.previousBufferContents)
+		c.previousBufferContents = nil
+		return
+	}
+	n, err = c.rwc.Read(p)
+	if err != nil {
+		if w := c.weakResponse.Value(); w != nil {
+			w.cancelCtx()
+			w.closeNotify()
+		}
+	}
+	return
+}
+
+// attach preserves the buffered bytes while attaching to the given reader.
+func (c *connCloseNotify) attach(r *bufio.Reader) (err error) {
+	n := r.Buffered()
+	if n != 0 {
+		if c.previousBufferContents, err = r.Peek(n); err != nil {
+			return
+		}
+	}
+	r.Reset(c)
+	if n != 0 {
+		_, err = r.Peek(n)
+	}
+	return
 }
 
 // connReader is the io.Reader wrapper used by *conn. It combines a
@@ -2244,7 +2292,7 @@ func (w *response) Hijack() (rwc net.Conn, buf *bufio.ReadWriter, err error) {
 
 	// Release the bufioWriter that writes to the chunk writer, it is not
 	// used after a connection has been hijacked.
-	rwc, buf, err = c.hijackLocked()
+	rwc, buf, err = c.hijackLocked(w)
 	if err == nil {
 		putBufioWriter(w.w)
 		w.w = nil
