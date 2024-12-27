@@ -332,7 +332,9 @@ func (c *conn) hijackLocked(w *response) (rwc net.Conn, buf *bufio.ReadWriter, e
 	}
 
 	ccn := &connCloseNotify{rwc: rwc, weakResponse: weak.Make(w)}
-	ccn.attach(c.bufr)
+	if err := ccn.attach(c.bufr); err != nil {
+		return nil, nil, fmt.Errorf("unexpected Peek failure while reattaching buffer: %v", err)
+	}
 	c.bufw.Reset(rwc)
 	buf = bufio.NewReadWriter(c.bufr, c.bufw)
 
