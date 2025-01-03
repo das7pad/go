@@ -6160,7 +6160,7 @@ func testServerHijackGetsFullBody(t *testing.T, mode testMode) {
 		t.Skip("skipping test; see https://golang.org/issue/18657")
 	}
 	done := make(chan struct{})
-	needle := strings.Repeat("x", 4096)
+	needle := strings.Repeat("x", 100*1024) // assume: larger than net/http bufio size
 	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
 		defer close(done)
 
@@ -6171,9 +6171,10 @@ func testServerHijackGetsFullBody(t *testing.T, mode testMode) {
 		}
 		defer conn.Close()
 
-		peek, err := buf.Reader.Peek(4096)
-		if string(peek) != needle || err != nil {
-			t.Errorf("Peek = %q, %v; want foo, nil", peek, err)
+		got := make([]byte, len(needle))
+		n, err := io.ReadFull(buf.Reader, got)
+		if n != len(needle) || string(got) != needle || err != nil {
+			t.Errorf("Peek = %q, %v; want 'x'*4096, nil", got, err)
 		}
 	})).ts
 
