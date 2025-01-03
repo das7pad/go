@@ -6249,7 +6249,10 @@ func testServerHijackGetsBackgroundByte_big(t *testing.T, mode testMode) {
 	<-done
 }
 
+// BenchmarkServerHijackMemoryUsage measures the memory usage from holding on
+// to the conn/r+w buffer after hijacking and returning from the handler.
 func BenchmarkServerHijackMemoryUsage(b *testing.B) {
+	const connsPerRun = 333 // Use a high number of conns to filter out noise.
 	echo := []byte("echo 01234")
 
 	// Client mode
@@ -6258,32 +6261,34 @@ func BenchmarkServerHijackMemoryUsage(b *testing.B) {
 		if err != nil {
 			panic(err)
 		}
-		clientBodies := make([]io.ReadWriteCloser, n)
 		for i := 0; i < n; i++ {
-			res, err := Get(url)
-			if err != nil {
-				log.Panicf("Get: %v", err)
+			clientBodies := make([]io.ReadWriteCloser, connsPerRun)
+			for j := 0; j < connsPerRun; j++ {
+				res, err := Get(url)
+				if err != nil {
+					log.Panicf("Get: %v", err)
+				}
+				clientBodies[j] = res.Body.(io.ReadWriteCloser)
 			}
-			clientBodies[i] = res.Body.(io.ReadWriteCloser)
-		}
-		for _, rwc := range clientBodies {
-			if _, err := rwc.Write(echo); err != nil {
-				log.Panicf("write: %v", err)
+			for _, rwc := range clientBodies {
+				if _, err := rwc.Write(echo); err != nil {
+					log.Panicf("write: %v", err)
+				}
 			}
-		}
-		readBuf := bytes.Buffer{}
-		readBuf.Grow(bytes.MinRead)
-		for _, rwc := range clientBodies {
-			readBuf.Reset()
-			n, err := readBuf.ReadFrom(rwc)
-			if err != nil || n != int64(len(echo)) {
-				log.Panicf("read: want=4, got=%d, err=%v", n, err)
+			readBuf := bytes.Buffer{}
+			readBuf.Grow(bytes.MinRead)
+			for _, rwc := range clientBodies {
+				readBuf.Reset()
+				n, err := readBuf.ReadFrom(rwc)
+				if err != nil || n != int64(len(echo)) {
+					log.Panicf("read: want=4, got=%d, err=%v", n, err)
+				}
+				reply := readBuf.Bytes()
+				if !bytes.Equal(reply, echo) {
+					log.Panicf("echo: want=%q, got=%q", string(echo), string(reply))
+				}
+				rwc.Close()
 			}
-			reply := readBuf.Bytes()
-			if !bytes.Equal(reply, echo) {
-				log.Panicf("echo: want=%q, got=%q", string(echo), string(reply))
-			}
-			rwc.Close()
 		}
 		os.Exit(0)
 		return
@@ -6294,10 +6299,9 @@ func BenchmarkServerHijackMemoryUsage(b *testing.B) {
 		rwc   net.Conn
 		rwBuf *bufio.ReadWriter
 	}
-	waitingConns := make(chan waitingConn, b.N)
+	waitingConns := make(chan waitingConn, connsPerRun)
 	handlerDone := make(chan struct{})
-	var before runtime.MemStats
-	var after runtime.MemStats
+	var start, before, after, finish runtime.MemStats
 
 	cst := newClientServerTest(b, http1Mode, HandlerFunc(func(w ResponseWriter, r *Request) {
 		w.Header().Set("Connection", "Upgrade")
@@ -6326,36 +6330,48 @@ func BenchmarkServerHijackMemoryUsage(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	runtime.ReadMemStats(&before)
 	b.ReportAllocs()
 	b.ResetTimer()
+	runtime.ReadMemStats(&start)
+	t0 := time.Now()
 
-	// accumulate connections
+	var retainedBytes int64
 	for i := 0; i < b.N; i++ {
-		<-handlerDone
-	}
+		runtime.GC()
+		runtime.ReadMemStats(&before)
 
-	runtime.GC()
-	runtime.ReadMemStats(&after)
-	b.ReportMetric(
-		float64(after.Alloc-before.Alloc)/float64(b.N), "retained_B/op",
-	)
-
-	close(waitingConns)
-	close(handlerDone)
-
-	// verify w+r
-	for wc := range waitingConns {
-		got, err := wc.rwBuf.Peek(len(echo))
-		if err != nil {
-			b.Fatal(err)
-		} else if !bytes.Equal(got, echo) {
-			b.Fatalf("echo=%q got=%q", string(echo), string(got))
+		// Accumulate connections
+		for j := 0; j < connsPerRun; j++ {
+			<-handlerDone
 		}
-		wc.rwBuf.Write(got)
-		wc.rwBuf.Flush()
-		wc.rwc.Close()
+
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		// Memory usage of the conns
+		retainedBytes += int64(after.Alloc) - int64(before.Alloc)
+
+		// Verify w+r
+		for j := 0; j < connsPerRun; j++ {
+			wc := <-waitingConns
+			got, err := wc.rwBuf.Peek(len(echo))
+			if err != nil {
+				b.Fatal(err)
+			} else if !bytes.Equal(got, echo) {
+				b.Fatalf("echo=%q got=%q", string(echo), string(got))
+			}
+			wc.rwBuf.Write(echo)
+			wc.rwBuf.Flush()
+			wc.rwc.Close()
+		}
 	}
+
+	runtime.ReadMemStats(&finish)
+	// Go the long way and report metrics per hijacked conn
+	ops := float64(connsPerRun * b.N)
+	b.ReportMetric(float64(time.Since(t0).Nanoseconds())/ops, "ns/op")
+	b.ReportMetric(float64(finish.TotalAlloc-start.TotalAlloc)/ops, "B/op")
+	b.ReportMetric(float64(finish.Mallocs-start.Mallocs)/ops, "allocs/op")
+	b.ReportMetric(float64(retainedBytes)/ops, "retained_B/op")
 
 	// Check client result
 	if err := cmd.Wait(); err != nil {
